@@ -1,20 +1,25 @@
 /*
  * ============================================================
  * SMART CAGE - ML INTEGRATED (SIC Phase 3)
- * ESP32 + DHT11 + MQTT + ML Prediction
+ * ESP32 + DHT11 + MQ2 Gas Sensor + MQTT + ML Prediction
  * ============================================================
  * 
  * FLOW:
- * 1. ESP32 baca sensor (DHT11)
- * 2. Publish data ke MQTT topic /data
+ * 1. ESP32 baca sensor (DHT11 + MQ2)
+ * 2. Publish data ke MQTT topics terpisah
  * 3. Dashboard ML terima data → Predict kondisi
- * 4. Dashboard publish prediksi ke topic /prediction
- * 5.ESP32 subscribe /prediction → Trigger output sesuai ML result
+ * 4. Dashboard publish prediksi ke prediction topics
+ * 5. ESP32 subscribe predictions → Trigger output
  * 
- * OUTPUT berdasarkan ML PREDICTION (bukan if-else):
+ * OUTPUT DHT11 (Suhu/Kelembapan):
  * - Ideal  → LED Hijau ON, Relay OFF (kipas nyala)
  * - Panas  → LED Merah kedip, Buzzer ON, Relay OFF
  * - Dingin → LED Kuning kedip, Buzzer ON, Relay ON
+ * 
+ * OUTPUT MQ2 (Gas):
+ * - Aman    → LED Hijau ON (MQ2 LOW)
+ * - Waspada → LED Kuning kedip, Buzzer beep (MQ2 HIGH)
+ * - Bahaya  → LED Merah cepat, Buzzer continuous (MQ2 HIGH + Suhu > 55°C)
  * ============================================================
  */
 
@@ -37,6 +42,7 @@
 #define PIN_BUZZER  26
 #define DHTPIN      4
 #define DHTTYPE     DHT11
+#define PIN_MQ2     15    // MQ2 Gas Sensor Digital Output
 
 // -------------------------
 // WIFI & MQTT CONFIG
@@ -45,8 +51,13 @@ const char* ssid = "SIC-UG";
 const char* password = "gunadarma";
 const char* mqtt_server = "broker.hivemq.com";
 
+// Topics for DHT11 (Temperature/Humidity)
 const char* topic_data = "final-project/Mahasiswa-Berpola-Pikir/smartcage/data";
 const char* topic_prediction = "final-project/Mahasiswa-Berpola-Pikir/smartcage/prediction";
+
+// Topics for MQ2 (Gas Sensor) - SEPARATE
+const char* topic_gas_data = "final-project/Mahasiswa-Berpola-Pikir/smartcage/gas/data";
+const char* topic_gas_prediction = "final-project/Mahasiswa-Berpola-Pikir/smartcage/gas/prediction";
 
 String clientId = "SmartCageESP32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
@@ -68,22 +79,34 @@ unsigned long previousMillisBlink = 0;
 unsigned long previousMillisBuzzer = 0;
 unsigned long previousMillisLCD = 0;
 
-const long intervalSensor = 2000;  // Baca sensor every 2s
+const long intervalSensor = 2000;   // Baca & publish sensor every 2s
 const long intervalBlink = 300;     // LED blink
 const long intervalBuzzer = 500;    // Buzzer beep
 const long intervalLCD = 100;       // LCD update
 
 // -------------------------
-// VARIABEL STATUS
+// VARIABEL STATUS DHT11
 // -------------------------
 float suhu = 0.0;
 float kelembapan = 0.0;
-String mlPrediction = "Waiting";    // Prediksi dari ML
-float mlConfidence = 0.0;           // Confidence dari ML
+String mlPrediction = "Waiting";
+float mlConfidence = 0.0;
 bool ledBlinkState = LOW;
 bool buzzerState = LOW;
 String lastLcdLine1 = "";
 String lastLcdLine2 = "";
+
+// -------------------------
+// VARIABEL STATUS MQ2 GAS
+// -------------------------
+bool gasDetected = false;           // MQ2 state (HIGH = gas detected)
+String gasKondisi = "Aman";         // Aman, Waspada, Bahaya
+String mlGasPrediction = "Waiting"; // ML gas prediction
+float mlGasConfidence = 0.0;
+bool gasLedBlinkState = LOW;
+bool gasBuzzerState = LOW;
+unsigned long previousMillisGasBlink = 0;
+unsigned long previousMillisGasBuzzer = 0;
 
 // -------------------------
 // SETUP WIFI
@@ -110,7 +133,6 @@ void setup_wifi() {
 // MQTT CALLBACK
 // -------------------------
 void callback(char* topic, byte* payload, unsigned int length) {
-  // Parse JSON dari dashboard ML
   StaticJsonDocument<256> doc;
   DeserializationError error = deserializeJson(doc, payload, length);
   
@@ -119,21 +141,39 @@ void callback(char* topic, byte* payload, unsigned int length) {
     return;
   }
   
-  // Extract ML prediction
-  String kondisi = doc["kondisi"];
-  float confidence = doc["confidence"];
+  String topicStr = String(topic);
   
-  mlPrediction = kondisi;
-  mlConfidence = confidence;
-  
-  Serial.println("======================");
-  Serial.println("ML PREDICTION RECEIVED:");
-  Serial.print("Kondisi: ");
-  Serial.println(kondisi);
-  Serial.print("Confidence: ");
-  Serial.print(confidence);
-  Serial.println("%");
-  Serial.println("======================");
+  // Check if it's DHT11 or Gas prediction
+  if (topicStr == topic_prediction) {
+    // DHT11 prediction
+    String kondisi = doc["kondisi"];
+    float confidence = doc["confidence"];
+    
+    mlPrediction = kondisi;
+    mlConfidence = confidence;
+    
+    Serial.println("=== ML DHT11 PREDICTION ===");
+    Serial.print("Kondisi: ");
+    Serial.println(kondisi);
+    Serial.print("Confidence: ");
+    Serial.print(confidence);
+    Serial.println("%");
+  }
+  else if (topicStr == topic_gas_prediction) {
+    // Gas prediction
+    String kondisi = doc["kondisi"];
+    float confidence = doc["confidence"];
+    
+    mlGasPrediction = kondisi;
+    mlGasConfidence = confidence;
+    
+    Serial.println("=== ML GAS PREDICTION ===");
+    Serial.print("Kondisi: ");
+    Serial.println(kondisi);
+    Serial.print("Confidence: ");
+    Serial.print(confidence);
+    Serial.println("%");
+  }
 }
 
 // -------------------------
@@ -146,14 +186,18 @@ void reconnect() {
     if (client.connect(clientId.c_str())) {
       Serial.println("connected!");
       
-      // Subscribe to prediction topic
+      // Subscribe to both prediction topics
       client.subscribe(topic_prediction);
-      Serial.print("Subscribed to: ");
+      Serial.print("Subscribed: ");
       Serial.println(topic_prediction);
+      
+      client.subscribe(topic_gas_prediction);
+      Serial.print("Subscribed: ");
+      Serial.println(topic_gas_prediction);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
-      Serial.println(" trying again in 2 seconds");
+      Serial.println(" retrying in 2s");
       delay(2000);
     }
   }
@@ -178,7 +222,7 @@ void setup() {
   // Setup WiFi & MQTT
   setup_wifi();
   client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);  // Set callback for ML prediction
+  client.setCallback(callback);
 
   // Setup OLED
   if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -193,6 +237,7 @@ void setup() {
   pinMode(PIN_HIJAU, OUTPUT);
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_MQ2, INPUT);  // MQ2 Digital Output
   
   // Default state
   digitalWrite(PIN_MERAH, LOW);
@@ -202,7 +247,7 @@ void setup() {
   digitalWrite(PIN_BUZZER, LOW);
 
   lcd.clear();
-  lcd.print("ML System Ready");
+  lcd.print("ML+Gas Ready");
   delay(1000);
   lcd.clear();
 }
@@ -225,93 +270,122 @@ void loop() {
   if (currentMillis - previousMillisSensor >= intervalSensor) {
     previousMillisSensor = currentMillis;
 
+    // Read DHT11
     suhu = dht.readTemperature();
     kelembapan = dht.readHumidity();
 
-    if (isnan(suhu) || isnan(kelembapan)) {
-      Serial.println("Sensor read error!");
-      return;
+    if (!isnan(suhu) && !isnan(kelembapan)) {
+      Serial.print("DHT11: T=");
+      Serial.print(suhu);
+      Serial.print("C, H=");
+      Serial.print(kelembapan);
+      Serial.println("%");
+
+      // Publish DHT11 data
+      StaticJsonDocument<256> doc;
+      doc["temp"] = suhu;
+      doc["humidity"] = kelembapan;
+
+      char payload[256];
+      serializeJson(doc, payload);
+      client.publish(topic_data, payload);
     }
 
-    Serial.print("Sensor → T=");
-    Serial.print(suhu);
-    Serial.print("°C, H=");
-    Serial.print(kelembapan);
-    Serial.println("%");
-
-    // Publish raw sensor data to ML dashboard
-    StaticJsonDocument<256> doc;
-    doc["temp"] = suhu;
-    doc["humidity"] = kelembapan;
-
-    char payload[256];
-    serializeJson(doc, payload);
-    client.publish(topic_data, payload);
+    // Read MQ2 - LOW = Gas Detected (standard MQ2 digital output)
+    // Most MQ2 modules: LOW when gas detected, HIGH when no gas
+    gasDetected = (digitalRead(PIN_MQ2) == LOW);
     
-    Serial.print("Published to ML: ");
-    Serial.println(payload);
+    // Determine gas kondisi
+    // Aman: No gas (MQ2 HIGH)
+    // Waspada: Gas detected (MQ2 LOW)
+    // Bahaya: Gas detected + Suhu > 55°C (kebakaran)
+    if (!gasDetected) {
+      gasKondisi = "Aman";
+    } else if (gasDetected && suhu > 55.0) {
+      gasKondisi = "Bahaya";
+    } else {
+      gasKondisi = "Waspada";
+    }
+
+    Serial.print("MQ2: Gas=");
+    Serial.print(gasDetected ? "YES" : "NO");
+    Serial.print(", Status=");
+    Serial.println(gasKondisi);
+
+    // Publish Gas data
+    StaticJsonDocument<256> gasDoc;
+    gasDoc["gas_detected"] = gasDetected;
+    gasDoc["temp"] = suhu;
+    gasDoc["kondisi_lokal"] = gasKondisi;
+
+    char gasPayload[256];
+    serializeJson(gasDoc, gasPayload);
+    client.publish(topic_gas_data, gasPayload);
 
     // Update OLED
     updateOLED();
   }
 
   // ===================================================================
-  // FASE 2: TRIGGER OUTPUT BERDASARKAN ML PREDICTION
+  // FASE 2: TRIGGER OUTPUT BERDASARKAN ML PREDICTION (DHT11)
   // ===================================================================
-  
-  if (mlPrediction == "Ideal") {
-    handleIdeal(currentMillis);
-  } 
-  else if (mlPrediction == "Panas") {
-    handlePanas(currentMillis);
-  } 
-  else if (mlPrediction == "Dingin") {
-    handleDingin(currentMillis);
-  }
-  else {
-    // Waiting for ML prediction
-    handleWaiting(currentMillis);
+  if (mlGasPrediction != "Bahaya" && mlGasPrediction != "Waspada") {
+    // Only handle DHT11 if gas is safe
+    if (mlPrediction == "Ideal") {
+      handleIdeal(currentMillis);
+    } 
+    else if (mlPrediction == "Panas") {
+      handlePanas(currentMillis);
+    } 
+    else if (mlPrediction == "Dingin") {
+      handleDingin(currentMillis);
+    }
+    else {
+      handleWaiting(currentMillis);
+    }
   }
 
   // ===================================================================
-  // FASE 3: UPDATE LCD
+  // FASE 3: TRIGGER OUTPUT BERDASARKAN ML PREDICTION (GAS)
+  // Gas alerts override temperature alerts
+  // ===================================================================
+  if (mlGasPrediction == "Bahaya") {
+    handleGasBahaya(currentMillis);
+  }
+  else if (mlGasPrediction == "Waspada") {
+    handleGasWaspada(currentMillis);
+  }
+
+  // ===================================================================
+  // FASE 4: UPDATE LCD
   // ===================================================================
   updateLCD(currentMillis);
 }
 
 // ===================================================================
-// FUNGSI HANDLER OUTPUT (BERDASARKAN ML PREDICTION)
+// FUNGSI HANDLER OUTPUT DHT11
 // ===================================================================
 
 void handleIdeal(unsigned long currentMillis) {
-  // LED Hijau ON, Merah & Kuning OFF
   digitalWrite(PIN_HIJAU, HIGH);
   digitalWrite(PIN_MERAH, LOW);
   digitalWrite(PIN_KUNING, LOW);
-  
-  // Relay OFF = Kipas NYALA
   digitalWrite(PIN_RELAY, LOW);
-  
-  // Buzzer OFF
   digitalWrite(PIN_BUZZER, LOW);
 }
 
 void handlePanas(unsigned long currentMillis) {
-  // LED Hijau & Kuning OFF
   digitalWrite(PIN_HIJAU, LOW);
   digitalWrite(PIN_KUNING, LOW);
   
-  // LED Merah BLINK
   if (currentMillis - previousMillisBlink >= intervalBlink) {
     previousMillisBlink = currentMillis;
     ledBlinkState = !ledBlinkState;
     digitalWrite(PIN_MERAH, ledBlinkState);
   }
   
-  // Relay OFF = Kipas NYALA (untuk cooling)
   digitalWrite(PIN_RELAY, LOW);
   
-  // Buzzer BEEP
   if (currentMillis - previousMillisBuzzer >= intervalBuzzer) {
     previousMillisBuzzer = currentMillis;
     buzzerState = !buzzerState;
@@ -320,21 +394,17 @@ void handlePanas(unsigned long currentMillis) {
 }
 
 void handleDingin(unsigned long currentMillis) {
-  // LED Hijau & Merah OFF
   digitalWrite(PIN_HIJAU, LOW);
   digitalWrite(PIN_MERAH, LOW);
   
-  // LED Kuning BLINK
   if (currentMillis - previousMillisBlink >= intervalBlink) {
     previousMillisBlink = currentMillis;
     ledBlinkState = !ledBlinkState;
     digitalWrite(PIN_KUNING, ledBlinkState);
   }
   
-  // Relay ON = Kipas MATI (untuk warming)
   digitalWrite(PIN_RELAY, HIGH);
   
-  // Buzzer BEEP
   if (currentMillis - previousMillisBuzzer >= intervalBuzzer) {
     previousMillisBuzzer = currentMillis;
     buzzerState = !buzzerState;
@@ -343,12 +413,50 @@ void handleDingin(unsigned long currentMillis) {
 }
 
 void handleWaiting(unsigned long currentMillis) {
-  // All LEDs OFF, waiting for ML
   digitalWrite(PIN_HIJAU, LOW);
   digitalWrite(PIN_MERAH, LOW);
   digitalWrite(PIN_KUNING, LOW);
   digitalWrite(PIN_RELAY, LOW);
   digitalWrite(PIN_BUZZER, LOW);
+}
+
+// ===================================================================
+// FUNGSI HANDLER OUTPUT GAS
+// ===================================================================
+
+void handleGasWaspada(unsigned long currentMillis) {
+  digitalWrite(PIN_HIJAU, LOW);
+  digitalWrite(PIN_MERAH, LOW);
+  
+  if (currentMillis - previousMillisGasBlink >= 400) {
+    previousMillisGasBlink = currentMillis;
+    gasLedBlinkState = !gasLedBlinkState;
+    digitalWrite(PIN_KUNING, gasLedBlinkState);
+  }
+  
+  if (currentMillis - previousMillisGasBuzzer >= 800) {
+    previousMillisGasBuzzer = currentMillis;
+    gasBuzzerState = !gasBuzzerState;
+    digitalWrite(PIN_BUZZER, gasBuzzerState);
+  }
+}
+
+void handleGasBahaya(unsigned long currentMillis) {
+  digitalWrite(PIN_HIJAU, LOW);
+  digitalWrite(PIN_KUNING, LOW);
+  
+  // LED Merah blink cepat
+  if (currentMillis - previousMillisGasBlink >= 100) {
+    previousMillisGasBlink = currentMillis;
+    gasLedBlinkState = !gasLedBlinkState;
+    digitalWrite(PIN_MERAH, gasLedBlinkState);
+  }
+  
+  // Buzzer continuous
+  digitalWrite(PIN_BUZZER, HIGH);
+  
+  // Relay ON (matikan kipas)
+  digitalWrite(PIN_RELAY, HIGH);
 }
 
 // ===================================================================
@@ -359,27 +467,33 @@ void updateOLED() {
   oled.clearDisplay();
   oled.setTextSize(1);
   oled.setCursor(0, 0);
-  oled.println("Smart Cage ML");
+  oled.println("Smart Cage ML+Gas");
   oled.drawLine(0, 10, 127, 10, SSD1306_WHITE);
   
-  oled.setCursor(0, 15);
-  oled.print("Suhu: ");
-  oled.print(suhu);
-  oled.println(" C");
-  
-  oled.setCursor(0, 25);
-  oled.print("Kelembapan: ");
-  oled.print(kelembapan);
+  // DHT11 Info
+  oled.setCursor(0, 13);
+  oled.print("T:");
+  oled.print(suhu, 1);
+  oled.print("C H:");
+  oled.print(kelembapan, 0);
   oled.println("%");
   
-  oled.setCursor(0, 40);
-  oled.print("ML: ");
+  oled.setCursor(0, 23);
+  oled.print("ML:");
   oled.println(mlPrediction);
   
-  oled.setCursor(0, 50);
-  oled.print("Conf: ");
-  oled.print(mlConfidence);
-  oled.println("%");
+  oled.drawLine(0, 33, 127, 33, SSD1306_WHITE);
+  
+  // Gas Info
+  oled.setCursor(0, 36);
+  oled.print("Gas:");
+  oled.print(gasDetected ? "YES" : "NO");
+  oled.print(" ");
+  oled.println(gasKondisi);
+  
+  oled.setCursor(0, 46);
+  oled.print("ML:");
+  oled.println(mlGasPrediction);
   
   oled.display();
 }
@@ -388,10 +502,19 @@ void updateLCD(unsigned long currentMillis) {
   if (currentMillis - previousMillisLCD >= intervalLCD) {
     previousMillisLCD = currentMillis;
     
-    String line1 = "ML: " + mlPrediction;
-    String line2 = String(suhu, 1) + "C " + String(kelembapan, 1) + "%";
+    // Alternate between DHT11 and Gas info every 3 seconds
+    bool showGas = ((currentMillis / 3000) % 2 == 1);
     
-    // Only update if changed
+    String line1, line2;
+    
+    if (showGas) {
+      line1 = "Gas:" + String(gasDetected ? "Y" : "N") + " " + gasKondisi;
+      line2 = "ML:" + mlGasPrediction;
+    } else {
+      line1 = "T:" + String(suhu, 1) + "C H:" + String(kelembapan, 0) + "%";
+      line2 = "ML:" + mlPrediction;
+    }
+    
     if (line1 != lastLcdLine1 || line2 != lastLcdLine2) {
       lcd.setCursor(0, 0);
       lcd.print("                ");
