@@ -209,35 +209,34 @@ void reconnect() {
 void setup() {
   Serial.begin(115200);
   Wire.begin();
-  dht.begin();
-
-  // Setup LCD
+  
+  // ===== LCD STARTUP SEQUENCE =====
+  
+  // Step 1: Initialize LCD & Show Starting
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
-  lcd.print("Smart Cage ML");
+  lcd.print("SmartCage ML");
   lcd.setCursor(0, 1);
   lcd.print("Starting...");
-
-  // Setup WiFi & MQTT
-  setup_wifi();
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-
-  // Setup OLED
-  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED init failed!");
-  }
-  oled.clearDisplay();
-  oled.setTextColor(SSD1306_WHITE);
-
+  delay(1500);
+  
+  // Step 2: Initialize Sensors
+  dht.begin();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Checking Sensor");
+  lcd.setCursor(0, 1);
+  lcd.print("DHT11 & MQ2...");
+  delay(1000);
+  
   // Setup pins
   pinMode(PIN_MERAH, OUTPUT);
   pinMode(PIN_KUNING, OUTPUT);
   pinMode(PIN_HIJAU, OUTPUT);
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_MQ2, INPUT);  // MQ2 Digital Output
+  pinMode(PIN_MQ2, INPUT);
   
   // Default state
   digitalWrite(PIN_MERAH, LOW);
@@ -245,10 +244,106 @@ void setup() {
   digitalWrite(PIN_HIJAU, LOW);
   digitalWrite(PIN_RELAY, LOW);
   digitalWrite(PIN_BUZZER, LOW);
-
+  
+  // Check DHT11
+  float testTemp = dht.readTemperature();
+  bool dhtOk = !isnan(testTemp);
+  
   lcd.clear();
-  lcd.print("ML+Gas Ready");
-  delay(1000);
+  lcd.setCursor(0, 0);
+  lcd.print(dhtOk ? "DHT11: OK" : "DHT11: FAIL");
+  lcd.setCursor(0, 1);
+  lcd.print("MQ2: OK");
+  delay(1500);
+  
+  // Step 3: Setup OLED
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed!");
+  }
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  
+  // Step 4: Connect WiFi
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  lcd.setCursor(0, 1);
+  lcd.print(ssid);
+  
+  WiFi.begin(ssid, password);
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 30) {
+    delay(500);
+    Serial.print(".");
+    wifiAttempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected!");
+    lcd.setCursor(0, 1);
+    lcd.print(ssid);
+    delay(1500);
+  } else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi FAILED!");
+    delay(2000);
+  }
+  
+  // Step 5: Connect MQTT
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting MQTT");
+  lcd.setCursor(0, 1);
+  lcd.print("broker.hivemq");
+  
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  
+  // Try MQTT connection
+  int mqttAttempts = 0;
+  while (!client.connected() && mqttAttempts < 5) {
+    if (client.connect(clientId.c_str())) {
+      Serial.println("MQTT connected!");
+      client.subscribe(topic_prediction);
+      client.subscribe(topic_gas_prediction);
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("MQTT Connected!");
+      lcd.setCursor(0, 1);
+      lcd.print("Ready to GO!");
+      delay(1500);
+    } else {
+      Serial.print("MQTT failed, rc=");
+      Serial.println(client.state());
+      mqttAttempts++;
+      delay(1000);
+    }
+  }
+  
+  if (!client.connected()) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MQTT FAILED!");
+    lcd.setCursor(0, 1);
+    lcd.print("Retry in loop");
+    delay(2000);
+  }
+  
+  // Step 6: All Ready!
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("System Ready!");
+  lcd.setCursor(0, 1);
+  lcd.print("ML+Gas Active");
+  delay(2000);
   lcd.clear();
 }
 
@@ -269,7 +364,7 @@ void loop() {
   // ===================================================================
   if (currentMillis - previousMillisSensor >= intervalSensor) {
     previousMillisSensor = currentMillis;
-
+x
     // Read DHT11
     suhu = dht.readTemperature();
     kelembapan = dht.readHumidity();
