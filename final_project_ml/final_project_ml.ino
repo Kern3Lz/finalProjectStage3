@@ -31,6 +31,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <ESP32Servo.h>
 
 // -------------------------
 // DEFINISI PIN
@@ -43,12 +44,19 @@
 #define DHTPIN      4
 #define DHTTYPE     DHT11
 #define PIN_MQ2     15    // MQ2 Gas Sensor Digital Output
+#define PIN_SERVO   13    // Servo Motor for Door
+#define PIN_BTN_DOOR 33   // Manual Button for Door Control
+
+// LDR Light Control
+#define PIN_LDR         32    // LDR Sensor (Analog Input)
+#define PIN_LDR_RELAY   27    // Relay untuk lampu (dikontrol LDR)
+#define PIN_LDR_BUTTON  5     // Button manual untuk lampu (prioritas)
 
 // -------------------------
 // WIFI & MQTT CONFIG
 // -------------------------
 const char* ssid = "SIC-UG";
-const char* password = "gunadarma";
+const char* password = "jayajayajaya";
 const char* mqtt_server = "broker.hivemq.com";
 
 // Topics for DHT11 (Temperature/Humidity)
@@ -58,6 +66,10 @@ const char* topic_prediction = "final-project/Mahasiswa-Berpola-Pikir/smartcage/
 // Topics for MQ2 (Gas Sensor) - SEPARATE
 const char* topic_gas_data = "final-project/Mahasiswa-Berpola-Pikir/smartcage/gas/data";
 const char* topic_gas_prediction = "final-project/Mahasiswa-Berpola-Pikir/smartcage/gas/prediction";
+
+// Topics for LDR (Light Sensor)
+const char* topic_ldr_data = "final-project/Mahasiswa-Berpola-Pikir/smartcage/ldr/data";
+const char* topic_ldr_prediction = "final-project/Mahasiswa-Berpola-Pikir/smartcage/ldr/prediction";
 
 String clientId = "SmartCageESP32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
@@ -79,7 +91,7 @@ unsigned long previousMillisBlink = 0;
 unsigned long previousMillisBuzzer = 0;
 unsigned long previousMillisLCD = 0;
 
-const long intervalSensor = 2000;   // Baca & publish sensor every 2s
+const long intervalSensor = 1500;   // Baca & publish sensor every 1.5s (safe for HiveMQ)
 const long intervalBlink = 300;     // LED blink
 const long intervalBuzzer = 500;    // Buzzer beep
 const long intervalLCD = 100;       // LCD update
@@ -109,6 +121,42 @@ unsigned long previousMillisGasBlink = 0;
 unsigned long previousMillisGasBuzzer = 0;
 
 // -------------------------
+// SERVO DOOR CONTROL
+// -------------------------
+Servo doorServo;
+bool doorOpen = false;              // Current door state (false=closed, true=open)
+int currentServoPos = 150;          // Current servo position (starts closed at 180)
+unsigned long lastButtonPress = 0;  // Debounce timer
+const long debounceDelay = 500;     // Button debounce delay
+const int DOOR_CLOSED_POS = 160;    // Closed = 180 degrees
+const int DOOR_OPEN_POS = 0;        // Open = 0 degrees
+
+// -------------------------
+// LDR + BUTTON CONTROL
+// -------------------------
+// Threshold untuk kondisi cahaya (ESP32 12-bit ADC: 0-4095)
+#define LDR_THRESHOLD_TERANG 1365   // 0-1365 = Terang
+#define LDR_THRESHOLD_REDUP  2730   // 1366-2730 = Redup
+                                    // 2731-4095 = Gelap
+
+// LDR timing & state
+unsigned long previousMillisLDR = 0;
+const long intervalLDR = 100;       // Baca LDR setiap 100ms
+
+// LDR button debounce
+unsigned long ldrButtonDebounceTime = 0;
+const long ldrButtonDebounceDelay = 50;
+int lastLdrButtonState = HIGH;
+int ldrButtonState = HIGH;
+unsigned long ldrButtonPressStart = 0;
+
+// LDR state
+int ldrValue = 100;
+String ldrCondition = "";
+bool ldrRelayState = false;
+bool ldrManualMode = false;   // true = button mengontrol relay lampu
+
+// -------------------------
 // SETUP WIFI
 // -------------------------
 void setup_wifi() {
@@ -130,7 +178,7 @@ void setup_wifi() {
 }
 
 // -------------------------
-// MQTT CALLBACK
+// MQTT CALLBACK (laporan)
 // -------------------------
 void callback(char* topic, byte* payload, unsigned int length) {
   StaticJsonDocument<256> doc;
@@ -174,6 +222,32 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Serial.print(confidence);
     Serial.println("%");
   }
+  else if (topicStr == topic_ldr_prediction) {
+    // LDR prediction
+    String kondisi = doc["kondisi"];
+    float confidence = doc["confidence"];
+    
+    Serial.println("=== ML LDR PREDICTION ===");
+    Serial.print("Kondisi: ");
+    Serial.println(kondisi);
+    Serial.print("Confidence: ");
+    Serial.print(confidence);
+    Serial.println("%");
+    
+    // Auto control relay based on ML prediction
+    // Gelap = turn ON light, Terang/Redup = turn OFF (if in auto mode)
+    if (!ldrManualMode) {
+      if (kondisi == "Gelap" && !ldrRelayState) {
+        ldrRelayState = true;
+        digitalWrite(PIN_LDR_RELAY, HIGH);
+        Serial.println("[ML] Light Relay ON (Gelap detected)");
+      } else if (kondisi != "Gelap" && ldrRelayState) {
+        ldrRelayState = false;
+        digitalWrite(PIN_LDR_RELAY, LOW);
+        Serial.println("[ML] Light Relay OFF (Terang/Redup detected)");
+      }
+    }
+  }
 }
 
 // -------------------------
@@ -194,6 +268,10 @@ void reconnect() {
       client.subscribe(topic_gas_prediction);
       Serial.print("Subscribed: ");
       Serial.println(topic_gas_prediction);
+      
+      client.subscribe(topic_ldr_prediction);
+      Serial.print("Subscribed: ");
+      Serial.println(topic_ldr_prediction);
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -204,7 +282,7 @@ void reconnect() {
 }
 
 // -------------------------
-// SETUP
+// SETUP (laporan) opsional
 // -------------------------
 void setup() {
   Serial.begin(115200);
@@ -237,6 +315,19 @@ void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_MQ2, INPUT);
+  pinMode(PIN_BTN_DOOR, INPUT_PULLUP);  // Button with internal pull-up
+  
+  // LDR Control pins
+  pinMode(PIN_LDR_RELAY, OUTPUT);
+  pinMode(PIN_LDR_BUTTON, INPUT_PULLUP);  // Button with internal pull-up
+  digitalWrite(PIN_LDR_RELAY, LOW);       // Start with light OFF
+  
+  // Setup Servo - start at closed position (180 degrees)
+  doorServo.attach(PIN_SERVO);
+  doorServo.write(DOOR_CLOSED_POS);
+  currentServoPos = DOOR_CLOSED_POS;
+  doorOpen = false;
+  delay(500);
   
   // Default state
   digitalWrite(PIN_MERAH, LOW);
@@ -348,7 +439,7 @@ void setup() {
 }
 
 // -------------------------
-// LOOP UTAMA
+// LOOP UTAMA (laporan)
 // -------------------------
 void loop() {
   // MQTT connection check
@@ -364,7 +455,7 @@ void loop() {
   // ===================================================================
   if (currentMillis - previousMillisSensor >= intervalSensor) {
     previousMillisSensor = currentMillis;
-x
+
     // Read DHT11
     suhu = dht.readTemperature();
     kelembapan = dht.readHumidity();
@@ -455,6 +546,16 @@ x
   // FASE 4: UPDATE LCD
   // ===================================================================
   updateLCD(currentMillis);
+  
+  // ===================================================================
+  // FASE 5: DOOR CONTROL (Button + Auto on Bahaya/Panas)
+  // ===================================================================
+  handleDoorControl(currentMillis);
+  
+  // ===================================================================
+  // FASE 6: LDR LIGHT CONTROL (Button Manual + Auto)
+  // ===================================================================
+  handleLDRControl(currentMillis);
 }
 
 // ===================================================================
@@ -597,17 +698,26 @@ void updateLCD(unsigned long currentMillis) {
   if (currentMillis - previousMillisLCD >= intervalLCD) {
     previousMillisLCD = currentMillis;
     
-    // Alternate between DHT11 and Gas info every 3 seconds
-    bool showGas = ((currentMillis / 3000) % 2 == 1);
+    // Rotate between 3 screens: DHT11, Gas, LDR (every 2 seconds)
+    int screenNum = (currentMillis / 2000) % 3;
     
     String line1, line2;
     
-    if (showGas) {
-      line1 = "Gas:" + String(gasDetected ? "Y" : "N") + " " + gasKondisi;
-      line2 = "ML:" + mlGasPrediction;
-    } else {
+    if (screenNum == 0) {
+      // Screen 1: DHT11 Temperature & Humidity
       line1 = "T:" + String(suhu, 1) + "C H:" + String(kelembapan, 0) + "%";
       line2 = "ML:" + mlPrediction;
+    } 
+    else if (screenNum == 1) {
+      // Screen 2: Gas Sensor
+      line1 = "Gas:" + String(gasDetected ? "Y" : "N") + " " + gasKondisi;
+      line2 = "ML:" + mlGasPrediction;
+    }
+    else {
+      // Screen 3: LDR Light Control Status
+      String ldrMode = ldrManualMode ? "MANUAL" : "AUTO";
+      line1 = "Light:" + ldrMode;
+      line2 = "LDR:" + String(ldrValue) + " " + (ldrRelayState ? "ON" : "OFF");
     }
     
     if (line1 != lastLcdLine1 || line2 != lastLcdLine2) {
@@ -623,6 +733,177 @@ void updateLCD(unsigned long currentMillis) {
       
       lastLcdLine1 = line1;
       lastLcdLine2 = line2;
+    }
+  }
+}
+
+// ===================================================================
+// FUNGSI DOOR CONTROL (SERVO) - Smooth Movement
+// ===================================================================
+
+// Open door: move servo from 180 to 0 degrees (smooth)
+void openDoor() {
+  if (!doorOpen) {
+    Serial.println("Opening door... (160 -> 0)");
+    for (int pos = currentServoPos; pos >= DOOR_OPEN_POS; pos--) {
+      doorServo.write(pos);
+      delay(15);  // Smooth movement speed
+    }
+    currentServoPos = DOOR_OPEN_POS;
+    doorOpen = true;
+    Serial.println("Door OPENED");
+  }
+}
+
+// Close door: move servo from 0 to 180 degrees (smooth)
+void closeDoor() {
+  if (doorOpen) {
+    Serial.println("Closing door... (0 -> 160)");
+    for (int pos = currentServoPos; pos <= DOOR_CLOSED_POS; pos++) {
+      doorServo.write(pos);
+      delay(15);  // Smooth movement speed
+    }
+    currentServoPos = DOOR_CLOSED_POS;
+    doorOpen = false;
+    Serial.println("Door CLOSED");
+  }
+}
+
+// Main door control handler
+void handleDoorControl(unsigned long currentMillis) {
+  // ===== MANUAL BUTTON CHECK =====
+  // Button is active LOW (INPUT_PULLUP: pressed = LOW)
+  if (digitalRead(PIN_BTN_DOOR) == LOW) {
+    // Debounce check - only trigger once per press
+    if (currentMillis - lastButtonPress >= debounceDelay) {
+      lastButtonPress = currentMillis;
+      
+      // Toggle door state
+      if (doorOpen) {
+        closeDoor();
+      } else {
+        openDoor();
+      }
+    }
+  }
+  
+  // ===== AUTOMATIC OPEN ON BAHAYA OR PANAS =====
+  // Auto-open door for emergency (Bahaya gas or Panas temperature)
+  if (!doorOpen) {
+    if (mlGasPrediction == "Bahaya" || mlPrediction == "Panas") {
+      Serial.println("AUTO: Emergency detected - Opening door!");
+      openDoor();
+    }
+  }
+}
+
+// ===================================================================
+// FUNGSI LDR LIGHT CONTROL (Button Priority + Auto)
+// ===================================================================
+
+void handleLDRControl(unsigned long currentMillis) {
+  // ===== HANDLE BUTTON DENGAN DEBOUNCE =====
+  int reading = digitalRead(PIN_LDR_BUTTON);
+  
+  if (reading != lastLdrButtonState) {
+    ldrButtonDebounceTime = currentMillis;
+  }
+  
+  if ((currentMillis - ldrButtonDebounceTime) > ldrButtonDebounceDelay) {
+    if (reading != ldrButtonState) {
+      ldrButtonState = reading;
+      
+      // Button ditekan (LOW karena INPUT_PULLUP)
+      if (ldrButtonState == LOW) {
+        // Aktifkan manual mode dan toggle relay
+        ldrManualMode = true;
+        ldrRelayState = !ldrRelayState;  // Toggle ON/OFF
+        digitalWrite(PIN_LDR_RELAY, ldrRelayState ? HIGH : LOW);
+        
+        Serial.println("\n****************************************");
+        Serial.println(">>> LDR BUTTON PRESSED - MANUAL MODE");
+        Serial.print(">>> Light Relay: ");
+        Serial.println(ldrRelayState ? "ON" : "OFF");
+        Serial.println("****************************************\n");
+      }
+    }
+  }
+  lastLdrButtonState = reading;
+  
+  // ===== LONG PRESS UNTUK KEMBALI KE AUTO MODE =====
+  if (ldrButtonState == LOW) {
+    if (ldrButtonPressStart == 0) {
+      ldrButtonPressStart = currentMillis;
+    } else if ((currentMillis - ldrButtonPressStart) > 3000) {
+      // Long press 3 detik -> kembali ke Auto
+      ldrManualMode = false;
+      ldrButtonPressStart = 0;
+      Serial.println("\n========================================");
+      Serial.println(">>> LDR KEMBALI KE AUTO MODE");
+      Serial.println("========================================\n");
+    }
+  } else {
+    ldrButtonPressStart = 0;
+  }
+  
+  // ===== BACA LDR DAN KONTROL RELAY =====
+  if (currentMillis - previousMillisLDR >= intervalLDR) {
+    previousMillisLDR = currentMillis;
+    
+    ldrValue = analogRead(PIN_LDR);
+    
+    bool ldrWantsRelayOn;
+    
+    if (ldrValue <= LDR_THRESHOLD_TERANG) {
+      ldrCondition = "Terang";
+      ldrWantsRelayOn = false;  // Terang = Lampu OFF
+    } 
+    else if (ldrValue <= LDR_THRESHOLD_REDUP) {
+      ldrCondition = "Redup";
+      ldrWantsRelayOn = false;  // Redup = Lampu OFF
+    } 
+    else {
+      ldrCondition = "Gelap";
+      ldrWantsRelayOn = true;   // Gelap = Lampu ON
+    }
+    
+    // Update relay HANYA jika AUTO mode (bukan manual)
+    if (!ldrManualMode) {
+      if (ldrWantsRelayOn != ldrRelayState) {
+        ldrRelayState = ldrWantsRelayOn;
+        digitalWrite(PIN_LDR_RELAY, ldrRelayState ? HIGH : LOW);
+        
+        Serial.println("----------------------------------------");
+        Serial.print("[LDR AUTO] Light Relay ");
+        Serial.println(ldrRelayState ? "ON! (Gelap)" : "OFF!");
+        Serial.println("----------------------------------------");
+      }
+    }
+    
+    // Print status setiap 1 detik (10 iterasi @ 100ms)
+    static int ldrPrintCount = 0;
+    ldrPrintCount++;
+    if (ldrPrintCount >= 10) {
+      ldrPrintCount = 0;
+      Serial.print("[LDR ");
+      Serial.print(ldrManualMode ? "MANUAL" : "AUTO");
+      Serial.print("] Val:");
+      Serial.print(ldrValue);
+      Serial.print(" | ");
+      Serial.print(ldrCondition);
+      Serial.print(" | Light:");
+      Serial.println(ldrRelayState ? "ON" : "OFF");
+      
+      // Publish LDR data to MQTT
+      StaticJsonDocument<256> ldrDoc;
+      ldrDoc["ldr_value"] = ldrValue;
+      ldrDoc["kondisi_lokal"] = ldrCondition;
+      ldrDoc["manual_mode"] = ldrManualMode;
+      ldrDoc["relay_state"] = ldrRelayState;
+      
+      char ldrPayload[256];
+      serializeJson(ldrDoc, ldrPayload);
+      client.publish(topic_ldr_data, ldrPayload);
     }
   }
 }

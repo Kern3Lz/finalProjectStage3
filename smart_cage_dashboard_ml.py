@@ -18,6 +18,11 @@ import paho.mqtt.client as mqtt
 from datetime import datetime
 import joblib
 import os
+import warnings
+
+# Suppress sklearn warnings
+warnings.filterwarnings('ignore', category=sklearn.exceptions.InconsistentVersionWarning)
+warnings.filterwarnings('ignore', message='X does not have valid feature names')
 
 # ============================================================
 # MQTT CONFIGURATION
@@ -32,6 +37,10 @@ TOPIC_PREDICTION = "final-project/Mahasiswa-Berpola-Pikir/smartcage/prediction"
 # MQ2 Gas Topics
 TOPIC_GAS_DATA = "final-project/Mahasiswa-Berpola-Pikir/smartcage/gas/data"
 TOPIC_GAS_PREDICTION = "final-project/Mahasiswa-Berpola-Pikir/smartcage/gas/prediction"
+
+# LDR Light Topics
+TOPIC_LDR_DATA = "final-project/Mahasiswa-Berpola-Pikir/smartcage/ldr/data"
+TOPIC_LDR_PREDICTION = "final-project/Mahasiswa-Berpola-Pikir/smartcage/ldr/prediction"
     
 # ============================================================
 # SESSION STATE INITIALIZATION
@@ -90,6 +99,27 @@ if "gas_model" not in st.session_state:
 if "gas_model_loaded" not in st.session_state:
     st.session_state.gas_model_loaded = False
 
+# LDR States
+if "ldr_logs" not in st.session_state:
+    st.session_state.ldr_logs = []
+
+if "ldr_last_data" not in st.session_state:
+    st.session_state.ldr_last_data = None
+
+if "ldr_stats" not in st.session_state:
+    st.session_state.ldr_stats = {
+        "total_messages": 0,
+        "terang_count": 0,
+        "redup_count": 0,
+        "gelap_count": 0
+    }
+
+if "ldr_model" not in st.session_state:
+    st.session_state.ldr_model = None
+
+if "ldr_model_loaded" not in st.session_state:
+    st.session_state.ldr_model_loaded = False
+
 if "mqtt" not in st.session_state:
     st.session_state.mqtt = None
 
@@ -132,6 +162,18 @@ def load_gas_model():
             return False, f"❌ Error: {e}"
     return False, f"⚠️ mq2_gas_model.pkl not found"
 
+def load_ldr_model():
+    model_path = "ldr_light_model.pkl"
+    if os.path.exists(model_path):
+        try:
+            model = joblib.load(model_path)
+            st.session_state.ldr_model = model
+            st.session_state.ldr_model_loaded = True
+            return True, f"✅ LDR Model loaded"
+        except Exception as e:
+            return False, f"❌ Error: {e}"
+    return False, f"⚠️ ldr_light_model.pkl not found"
+
 def change_age_category(age_category):
     if age_category in AGE_MODEL_MAPPING:
         st.session_state.current_age_category = age_category
@@ -139,16 +181,18 @@ def change_age_category(age_category):
     return False, "Invalid category"
 
 # ============================================================
-# MQTT CALLBACKS
+# MQTT CALLBACKS (API Version 2)
 # ============================================================
-def on_connect(client, userdata, flags, rc, properties=None):
-    if rc == 0:
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
         st.session_state.connected = True
         client.subscribe(TOPIC_DATA)
         client.subscribe(TOPIC_GAS_DATA)
-        print(f"✅ Connected & subscribed")
+        client.subscribe(TOPIC_LDR_DATA)
+        print(f"✅ Connected & subscribed to all topics")
     else:
         st.session_state.connected = False
+        print(f"❌ Connection failed: {reason_code}")
 
 def on_message(client, userdata, msg):
     global st
@@ -162,6 +206,8 @@ def on_message(client, userdata, msg):
             handle_dht_message(client, data, timestamp)
         elif topic == TOPIC_GAS_DATA:
             handle_gas_message(client, data, timestamp)
+        elif topic == TOPIC_LDR_DATA:
+            handle_ldr_message(client, data, timestamp)
             
     except Exception as e:
         print(f"❌ Error: {e}")
@@ -281,11 +327,76 @@ def handle_gas_message(client, data, timestamp):
     elif kondisi == "Bahaya":
         st.session_state.gas_stats["bahaya_count"] += 1
 
+def handle_ldr_message(client, data, timestamp):
+    ldr_value = int(data.get('ldr_value', 0))
+    
+    kondisi = "Unknown"
+    confidence = 0.0
+    
+    if st.session_state.ldr_model_loaded and st.session_state.ldr_model is not None:
+        try:
+            X_input = [[ldr_value]]
+            prediction = st.session_state.ldr_model.predict(X_input)[0]
+            kondisi = prediction
+            
+            if hasattr(st.session_state.ldr_model, 'predict_proba'):
+                proba = st.session_state.ldr_model.predict_proba(X_input)[0]
+                confidence = max(proba) * 100
+            else:
+                confidence = 100.0
+            
+            prediction_payload = json.dumps({
+                "kondisi": kondisi,
+                "confidence": round(confidence, 2),
+                "timestamp": timestamp
+            })
+            client.publish(TOPIC_LDR_PREDICTION, prediction_payload)
+            
+        except Exception as e:
+            kondisi = "Error"
+    else:
+        # Rule-based fallback (ESP32 12-bit ADC: 0-4095)
+        if ldr_value <= 1365:
+            kondisi = "Terang"
+        elif ldr_value <= 2730:
+            kondisi = "Redup"
+        else:
+            kondisi = "Gelap"
+        confidence = 100.0
+        
+        prediction_payload = json.dumps({
+            "kondisi": kondisi,
+            "confidence": 100.0,
+            "timestamp": timestamp
+        })
+        client.publish(TOPIC_LDR_PREDICTION, prediction_payload)
+    
+    log_entry = {
+        "timestamp": timestamp,
+        "ldr_value": ldr_value,
+        "kondisi": kondisi,
+        "confidence": confidence
+    }
+    
+    st.session_state.ldr_last_data = log_entry
+    st.session_state.ldr_logs.append(log_entry)
+    
+    st.session_state.ldr_stats["total_messages"] += 1
+    if kondisi == "Terang":
+        st.session_state.ldr_stats["terang_count"] += 1
+    elif kondisi == "Redup":
+        st.session_state.ldr_stats["redup_count"] += 1
+    elif kondisi == "Gelap":
+        st.session_state.ldr_stats["gelap_count"] += 1
+
 # ============================================================
 # START MQTT CLIENT
 # ============================================================
 if st.session_state.mqtt is None:
-    client = mqtt.Client(client_id=f"MLDashboard_{int(time.time())}")
+    client = mqtt.Client(
+        client_id=f"MLDashboard_{int(time.time())}",
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2
+    )
     client.on_connect = on_connect
     client.on_message = on_message
     
@@ -312,18 +423,24 @@ with st.sidebar:
     
     # MONITORING MODE TOGGLE
     st.subheader("📊 Mode Monitoring")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
-        if st.button("🌡️ Suhu", use_container_width=True,
+        if st.button("🌡️ Suhu", width='stretch',
                      type="primary" if st.session_state.monitoring_mode == "suhu" else "secondary"):
             st.session_state.monitoring_mode = "suhu"
             st.rerun()
     
     with col2:
-        if st.button("💨 Gas", use_container_width=True,
+        if st.button("💨 Gas", width='stretch',
                      type="primary" if st.session_state.monitoring_mode == "gas" else "secondary"):
             st.session_state.monitoring_mode = "gas"
+            st.rerun()
+    
+    with col3:
+        if st.button("💡 LDR", width='stretch',
+                     type="primary" if st.session_state.monitoring_mode == "ldr" else "secondary"):
+            st.session_state.monitoring_mode = "ldr"
             st.rerun()
     
     st.info(f"Mode: **{st.session_state.monitoring_mode.upper()}**")
@@ -334,24 +451,24 @@ with st.sidebar:
         st.subheader("🐔 Umur Ayam")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("🐣 0-3", use_container_width=True,
+            if st.button("🐣 0-3", width='stretch',
                          type="primary" if st.session_state.current_age_category == "0-3" else "secondary"):
                 change_age_category("0-3")
                 st.rerun()
-            if st.button("🐥 8-14", use_container_width=True,
+            if st.button("🐥 8-14", width='stretch',
                          type="primary" if st.session_state.current_age_category == "8-14" else "secondary"):
                 change_age_category("8-14")
                 st.rerun()
-            if st.button("🐓 22-30", use_container_width=True,
+            if st.button("🐓 22-30", width='stretch',
                          type="primary" if st.session_state.current_age_category == "22-30" else "secondary"):
                 change_age_category("22-30")
                 st.rerun()
         with c2:
-            if st.button("🐤 4-7", use_container_width=True,
+            if st.button("🐤 4-7", width='stretch',
                          type="primary" if st.session_state.current_age_category == "4-7" else "secondary"):
                 change_age_category("4-7")
                 st.rerun()
-            if st.button("🐔 15-21", use_container_width=True,
+            if st.button("🐔 15-21", width='stretch',
                          type="primary" if st.session_state.current_age_category == "15-21" else "secondary"):
                 change_age_category("15-21")
                 st.rerun()
@@ -365,7 +482,7 @@ with st.sidebar:
             st.success("✅ Model loaded")
         else:
             st.warning("⚠️ No model")
-    else:
+    elif st.session_state.monitoring_mode == "gas":
         st.subheader("💨 Gas Model")
         
         uploaded = st.file_uploader("Upload mq2_gas_model.pkl", type=['pkl'])
@@ -380,6 +497,24 @@ with st.sidebar:
         
         if st.session_state.gas_model_loaded:
             st.success("✅ Gas model loaded")
+        else:
+            st.info("ℹ️ Using rule-based")
+    
+    elif st.session_state.monitoring_mode == "ldr":
+        st.subheader("💡 LDR Model")
+        
+        uploaded = st.file_uploader("Upload ldr_light_model.pkl", type=['pkl'])
+        if uploaded:
+            with open("ldr_light_model.pkl", "wb") as f:
+                f.write(uploaded.getbuffer())
+            load_ldr_model()
+            st.success("Uploaded!")
+        
+        if not st.session_state.ldr_model_loaded:
+            load_ldr_model()
+        
+        if st.session_state.ldr_model_loaded:
+            st.success("✅ LDR model loaded")
         else:
             st.info("ℹ️ Using rule-based")
     
@@ -461,14 +596,14 @@ if st.session_state.monitoring_mode == "suhu":
             with tab2:
                 st.bar_chart(df["kondisi"].value_counts())
             with tab3:
-                st.dataframe(df.tail(15), use_container_width=True)
+                st.dataframe(df.tail(15), width='stretch')
         else:
             st.info("📡 Waiting for data...")
 
 # ============================================================
 # GAS MODE
 # ============================================================
-else:
+elif st.session_state.monitoring_mode == "gas":
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Messages", st.session_state.gas_stats["total_messages"])
@@ -529,9 +664,77 @@ else:
             with tab2:
                 st.bar_chart(df["kondisi"].value_counts())
             with tab3:
-                st.dataframe(df.tail(15), use_container_width=True)
+                st.dataframe(df.tail(15), width='stretch')
         else:
             st.info("📡 Waiting for gas data...")
+
+# ============================================================
+# LDR MODE
+# ============================================================
+elif st.session_state.monitoring_mode == "ldr":
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Messages", st.session_state.ldr_stats["total_messages"])
+    with col2:
+        if st.session_state.ldr_last_data:
+            st.metric("LDR Value", st.session_state.ldr_last_data['ldr_value'])
+        else:
+            st.metric("LDR Value", "---")
+    with col3:
+        if st.session_state.ldr_last_data:
+            kondisi = st.session_state.ldr_last_data['kondisi']
+            st.metric("Kondisi", kondisi)
+        else:
+            st.metric("Kondisi", "---")
+    with col4:
+        if st.session_state.ldr_last_data:
+            st.metric("Confidence", f"{st.session_state.ldr_last_data.get('confidence', 0):.1f}%")
+        else:
+            st.metric("Confidence", "---")
+    
+    st.divider()
+    
+    left, right = st.columns([1, 2])
+    
+    with left:
+        st.subheader("💡 Prediction")
+        if st.session_state.ldr_last_data:
+            kondisi = st.session_state.ldr_last_data["kondisi"]
+            conf = st.session_state.ldr_last_data.get("confidence", 0)
+            if kondisi == "Terang":
+                st.success(f"☀️ {kondisi} ({conf:.1f}%)")
+            elif kondisi == "Redup":
+                st.warning(f"🌤️ {kondisi} ({conf:.1f}%)")
+            elif kondisi == "Gelap":
+                st.error(f"🌙 {kondisi} ({conf:.1f}%)")
+            else:
+                st.info(f"❓ {kondisi}")
+        else:
+            st.info("⏳ Waiting...")
+        
+        st.divider()
+        st.subheader("📈 Stats")
+        stats = st.session_state.ldr_stats
+        if stats["total_messages"] > 0:
+            total = stats["total_messages"]
+            st.write(f"☀️ Terang: {stats['terang_count']} ({stats['terang_count']/total*100:.1f}%)")
+            st.write(f"🌤️ Redup: {stats['redup_count']} ({stats['redup_count']/total*100:.1f}%)")
+            st.write(f"🌙 Gelap: {stats['gelap_count']} ({stats['gelap_count']/total*100:.1f}%)")
+    
+    with right:
+        st.subheader("📊 Monitoring - LDR")
+        if len(st.session_state.ldr_logs) >= 2:
+            df = pd.DataFrame(st.session_state.ldr_logs)
+            tab1, tab2, tab3 = st.tabs(["📈 Chart", "📊 Distribution", "📋 Data"])
+            with tab1:
+                chart_df = df[["timestamp", "ldr_value"]].set_index("timestamp")
+                st.line_chart(chart_df)
+            with tab2:
+                st.bar_chart(df["kondisi"].value_counts())
+            with tab3:
+                st.dataframe(df.tail(15), width='stretch')
+        else:
+            st.info("📡 Waiting for LDR data...")
 
 # ============================================================
 # FOOTER
@@ -557,5 +760,5 @@ with c3:
 if st.session_state.mqtt:
     st.session_state.mqtt.loop(timeout=0.1)
 
-time.sleep(1)
+time.sleep(0.15)
 st.rerun()
