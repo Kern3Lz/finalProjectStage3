@@ -120,6 +120,60 @@ if "ldr_model" not in st.session_state:
 if "ldr_model_loaded" not in st.session_state:
     st.session_state.ldr_model_loaded = False
 
+# Admin Mode - Password Protected Control
+ADMIN_PASSWORD = "smartcage"
+ADMIN_SESSION_FILE = "admin_session.json"
+
+# ============================================================
+# ADMIN SESSION HELPER FUNCTIONS
+# ============================================================
+import random
+import string
+
+def generate_session_id():
+    """Generate unique session ID"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{timestamp}_{random_str}"
+
+def write_admin_session(session_id):
+    """Write admin session to file"""
+    session_data = {
+        "session_id": session_id,
+        "login_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    with open(ADMIN_SESSION_FILE, "w") as f:
+        json.dump(session_data, f)
+
+def read_admin_session():
+    """Read current admin session from file"""
+    if os.path.exists(ADMIN_SESSION_FILE):
+        try:
+            with open(ADMIN_SESSION_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
+
+def clear_admin_session():
+    """Delete session file on logout"""
+    if os.path.exists(ADMIN_SESSION_FILE):
+        os.remove(ADMIN_SESSION_FILE)
+
+def check_session_valid(current_session_id):
+    """Check if current session is still valid"""
+    session_data = read_admin_session()
+    if session_data is None:
+        return False
+    return session_data.get("session_id") == current_session_id
+
+# Session state for admin
+if "admin_logged_in" not in st.session_state:
+    st.session_state.admin_logged_in = False
+
+if "admin_session_id" not in st.session_state:
+    st.session_state.admin_session_id = None
+
 if "mqtt" not in st.session_state:
     st.session_state.mqtt = None
 
@@ -174,10 +228,47 @@ def load_ldr_model():
             return False, f"❌ Error: {e}"
     return False, f"⚠️ ldr_light_model.pkl not found"
 
+# ============================================================
+# SHARED SETTINGS (Sync across all sessions)
+# ============================================================
+SETTINGS_FILE = "current_settings.json"
+
+def save_shared_settings():
+    """Save current settings to shared file"""
+    settings = {
+        "age_category": st.session_state.current_age_category,
+        "model_path": st.session_state.current_model_path
+    }
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(settings, f)
+
+def load_shared_settings():
+    """Load settings from shared file"""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return None
+    return None
+
+def sync_settings_from_file():
+    """Sync session state with shared settings file"""
+    settings = load_shared_settings()
+    if settings:
+        new_age = settings.get("age_category")
+        if new_age and new_age != st.session_state.current_age_category:
+            st.session_state.current_age_category = new_age
+            if new_age in AGE_MODEL_MAPPING:
+                load_dht_model(AGE_MODEL_MAPPING[new_age])
+
 def change_age_category(age_category):
     if age_category in AGE_MODEL_MAPPING:
         st.session_state.current_age_category = age_category
-        return load_dht_model(AGE_MODEL_MAPPING[age_category])
+        result = load_dht_model(AGE_MODEL_MAPPING[age_category])
+        # Save to shared file so other sessions can sync
+        save_shared_settings()
+        return result
     return False, "Invalid category"
 
 # ============================================================
@@ -421,7 +512,45 @@ st.set_page_config(
 with st.sidebar:
     st.title("🤖 ML Dashboard")
     
-    # MONITORING MODE TOGGLE
+    # ===== SYNC SETTINGS FROM FILE (for all sessions) =====
+    sync_settings_from_file()
+    
+    # ===== CHECK SESSION VALIDITY =====
+    if st.session_state.admin_logged_in:
+        if not check_session_valid(st.session_state.admin_session_id):
+            # Session taken over by another device
+            st.session_state.admin_logged_in = False
+            st.session_state.admin_session_id = None
+            st.warning("⚠️ Session dipindah ke device lain!")
+    
+    # ===== ADMIN LOGIN SECTION =====
+    st.subheader("🔐 Admin Access")
+    if st.session_state.admin_logged_in:
+        st.success("✅ Admin Mode Active")
+        if st.button("🚪 Logout", width='stretch'):
+            clear_admin_session()
+            st.session_state.admin_logged_in = False
+            st.session_state.admin_session_id = None
+            st.rerun()
+    else:
+        st.info("👁️ Viewer Mode (Read-Only)")
+        with st.expander("🔑 Login Admin"):
+            password = st.text_input("Password", type="password", key="admin_pass")
+            if st.button("Login", width='stretch'):
+                if password == ADMIN_PASSWORD:
+                    # Generate and store session
+                    new_session_id = generate_session_id()
+                    write_admin_session(new_session_id)
+                    st.session_state.admin_session_id = new_session_id
+                    st.session_state.admin_logged_in = True
+                    st.success("Login berhasil!")
+                    st.rerun()
+                else:
+                    st.error("Password salah!")
+    
+    st.divider()
+    
+    # MONITORING MODE TOGGLE (Available for all)
     st.subheader("📊 Mode Monitoring")
     col1, col2, col3 = st.columns(3)
     
@@ -446,32 +575,36 @@ with st.sidebar:
     st.info(f"Mode: **{st.session_state.monitoring_mode.upper()}**")
     st.divider()
     
-    # MODE-SPECIFIC SETTINGS
+    # MODE-SPECIFIC SETTINGS (ADMIN ONLY)
     if st.session_state.monitoring_mode == "suhu":
         st.subheader("🐔 Umur Ayam")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("🐣 0-3", width='stretch',
-                         type="primary" if st.session_state.current_age_category == "0-3" else "secondary"):
-                change_age_category("0-3")
-                st.rerun()
-            if st.button("🐥 8-14", width='stretch',
-                         type="primary" if st.session_state.current_age_category == "8-14" else "secondary"):
-                change_age_category("8-14")
-                st.rerun()
-            if st.button("🐓 22-30", width='stretch',
-                         type="primary" if st.session_state.current_age_category == "22-30" else "secondary"):
-                change_age_category("22-30")
-                st.rerun()
-        with c2:
-            if st.button("🐤 4-7", width='stretch',
-                         type="primary" if st.session_state.current_age_category == "4-7" else "secondary"):
-                change_age_category("4-7")
-                st.rerun()
-            if st.button("🐔 15-21", width='stretch',
-                         type="primary" if st.session_state.current_age_category == "15-21" else "secondary"):
-                change_age_category("15-21")
-                st.rerun()
+        
+        if st.session_state.admin_logged_in:
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🐣 0-3", width='stretch',
+                             type="primary" if st.session_state.current_age_category == "0-3" else "secondary"):
+                    change_age_category("0-3")
+                    st.rerun()
+                if st.button("🐥 8-14", width='stretch',
+                             type="primary" if st.session_state.current_age_category == "8-14" else "secondary"):
+                    change_age_category("8-14")
+                    st.rerun()
+                if st.button("🐓 22-30", width='stretch',
+                             type="primary" if st.session_state.current_age_category == "22-30" else "secondary"):
+                    change_age_category("22-30")
+                    st.rerun()
+            with c2:
+                if st.button("🐤 4-7", width='stretch',
+                             type="primary" if st.session_state.current_age_category == "4-7" else "secondary"):
+                    change_age_category("4-7")
+                    st.rerun()
+                if st.button("🐔 15-21", width='stretch',
+                             type="primary" if st.session_state.current_age_category == "15-21" else "secondary"):
+                    change_age_category("15-21")
+                    st.rerun()
+        else:
+            st.warning("🔒 Login admin untuk ubah umur")
         
         st.caption(f"Aktif: {st.session_state.current_age_category} hari")
         
@@ -482,15 +615,9 @@ with st.sidebar:
             st.success("✅ Model loaded")
         else:
             st.warning("⚠️ No model")
+            
     elif st.session_state.monitoring_mode == "gas":
         st.subheader("💨 Gas Model")
-        
-        uploaded = st.file_uploader("Upload mq2_gas_model.pkl", type=['pkl'])
-        if uploaded:
-            with open("mq2_gas_model.pkl", "wb") as f:
-                f.write(uploaded.getbuffer())
-            load_gas_model()
-            st.success("Uploaded!")
         
         if not st.session_state.gas_model_loaded:
             load_gas_model()
@@ -502,13 +629,6 @@ with st.sidebar:
     
     elif st.session_state.monitoring_mode == "ldr":
         st.subheader("💡 LDR Model")
-        
-        uploaded = st.file_uploader("Upload ldr_light_model.pkl", type=['pkl'])
-        if uploaded:
-            with open("ldr_light_model.pkl", "wb") as f:
-                f.write(uploaded.getbuffer())
-            load_ldr_model()
-            st.success("Uploaded!")
         
         if not st.session_state.ldr_model_loaded:
             load_ldr_model()
